@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from html import escape
 import time
 from datetime import datetime
 from typing import Any
@@ -200,6 +201,25 @@ def settings_sidebar() -> dict[str, Any]:
 settings = settings_sidebar()
 
 
+
+def metric_card(label: str, value: Any, help_text: str = "") -> str:
+    label_safe = escape(str(label))
+    value_safe = escape(str(value))
+    help_safe = escape(str(help_text)) if help_text else ""
+    help_html = f'<div class="gf-metric-help">{help_safe}</div>' if help_safe else ""
+    return f"""
+    <div class="gf-metric-card">
+        <div class="gf-metric-label">{label_safe}</div>
+        <div class="gf-metric-value">{value_safe}</div>
+        {help_html}
+    </div>
+    """
+
+
+def render_metric(col, label: str, value: Any, help_text: str = "") -> None:
+    col.markdown(metric_card(label, value, help_text), unsafe_allow_html=True)
+
+
 def metric_row(stats: dict[str, Any]) -> None:
     cols = st.columns(8)
     values = [
@@ -214,7 +234,8 @@ def metric_row(stats: dict[str, Any]) -> None:
     ]
 
     for col, (label, value) in zip(cols, values):
-        col.metric(label, value)
+        render_metric(col, label, value)
+
 
 
 def dataframe_from_results(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -446,10 +467,10 @@ with tab_dashboard:
     metric_row(st.session_state.get("last_stats", {}))
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Raw discoveries saved", len(raw_rows))
-    c2.metric("Unique saved links", len(rows))
-    c3.metric("Unique domains", df["source_domain"].nunique() if not df.empty else 0)
-    c4.metric("Unreviewed", int((df["review_status"] == "unreviewed").sum()) if not df.empty else 0)
+    render_metric(c1, "Raw discoveries saved", len(raw_rows))
+    render_metric(c2, "Unique saved links", len(rows))
+    render_metric(c3, "Unique domains", df["source_domain"].nunique() if not df.empty else 0)
+    render_metric(c4, "Unreviewed", int((df["review_status"] == "unreviewed").sum()) if not df.empty else 0)
 
     st.markdown(
         """
@@ -651,7 +672,7 @@ with tab_exports:
     kept_rows = [r for r in filtered_rows if r.get("keep_status") == "keep"]
 
     with c0:
-        st.metric("Raw discoveries", len(raw_rows))
+        render_metric(st, "Raw discoveries", len(raw_rows))
         st.download_button(
             "Download ALL RAW CSV",
             data=rows_to_csv_bytes(raw_rows),
@@ -668,7 +689,7 @@ with tab_exports:
         )
 
     with c1:
-        st.metric("Filtered unique", len(filtered_rows))
+        render_metric(st, "Filtered unique", len(filtered_rows))
         st.download_button(
             "Download Filtered Unique CSV",
             data=rows_to_csv_bytes(filtered_rows),
@@ -685,7 +706,7 @@ with tab_exports:
         )
 
     with c2:
-        st.metric("All unique saved", len(rows))
+        render_metric(st, "All unique saved", len(rows))
         st.download_button(
             "Download ALL UNIQUE CSV",
             data=rows_to_csv_bytes(rows),
@@ -702,7 +723,7 @@ with tab_exports:
         )
 
     with c3:
-        st.metric("Reviewed / Kept", f"{len(reviewed_rows)} / {len(kept_rows)}")
+        render_metric(st, "Reviewed / Kept", f"{len(reviewed_rows)} / {len(kept_rows)}")
         st.download_button(
             "Download Reviewed CSV",
             data=rows_to_csv_bytes(reviewed_rows),
