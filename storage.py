@@ -34,6 +34,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "use_browser_fallback": True,
     "browser_timeout_ms": 15000,
     "browser_steps": 10,
+    "ajax_wait_seconds": 8.0,
+    "scroll_rounds": 10,
     "same_domain_only": True,
     "save_every_results": 1,
 }

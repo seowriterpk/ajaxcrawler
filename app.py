@@ -171,8 +171,24 @@ def settings_sidebar() -> dict[str, Any]:
         browser_steps = st.slider(
             "Browser funnel steps",
             min_value=1,
-            max_value=20,
+            max_value=30,
             value=int(current.get("browser_steps", DEFAULT_SETTINGS["browser_steps"])),
+        )
+
+        ajax_wait_seconds = st.slider(
+            "AJAX wait seconds",
+            min_value=1.0,
+            max_value=20.0,
+            value=float(current.get("ajax_wait_seconds", DEFAULT_SETTINGS.get("ajax_wait_seconds", 8.0))),
+            step=0.5,
+        )
+
+        scroll_rounds = st.slider(
+            "Lazy scroll rounds",
+            min_value=1,
+            max_value=60,
+            value=int(current.get("scroll_rounds", DEFAULT_SETTINGS.get("scroll_rounds", 10))),
+            step=1,
         )
 
         settings = {
@@ -186,6 +202,8 @@ def settings_sidebar() -> dict[str, Any]:
             "use_browser_fallback": bool(use_browser_fallback),
             "browser_timeout_ms": int(browser_timeout_ms),
             "browser_steps": int(browser_steps),
+            "ajax_wait_seconds": float(ajax_wait_seconds),
+            "scroll_rounds": int(scroll_rounds),
             "same_domain_only": bool(same_domain_only),
             "save_every_results": 5,
         }
@@ -494,8 +512,8 @@ with tab_crawl:
         """
         <div class="gf-note">
         Paste seed URLs below. For AJAX-heavy sites, keep Playwright fallback enabled. The crawler will scan
-        public HTML first, then use browser rendering to observe network responses, click load-more/show-more/join
-        controls, scroll lazy-loaded pages, and rescan popup content.
+        public HTML first, then use browser rendering to wait 5–8+ seconds, observe AJAX/fetch responses,
+        scroll lazy-loaded pages, click load-more/show-more/join controls, and rescan popup content.
         </div>
         """,
         unsafe_allow_html=True,

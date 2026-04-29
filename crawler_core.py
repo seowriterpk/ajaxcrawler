@@ -24,6 +24,25 @@ WHATSAPP_RE = re.compile(
     """
 )
 
+
+# Public directory pages often hide the final WhatsApp URL behind internal
+# /group/invite/<code>, /group/join/<code>, or /group/rules/<code> paths.
+# On Groupsor-like sites, that code is the public invite code used on the final
+# WhatsApp URL. This gives the crawler a deterministic public-page extraction
+# path even when the site loads cards through delayed AJAX/lazy scroll.
+DIRECTORY_INTERNAL_GROUP_RE = re.compile(
+    r"""(?ix)
+    https?://(?P<host>[^\s"'<>]+?)/group/(?P<kind>invite|join|rules)/(?P<code>[A-Za-z0-9_-]{8,})
+    |
+    (?P<rel>/group/(?P<kind2>invite|join|rules)/(?P<code2>[A-Za-z0-9_-]{8,}))
+    """
+)
+
+GROUPSOR_HOST_HINTS = {
+    "groupsor.link",
+    "www.groupsor.link",
+}
+
 GOOD_CLICK_WORDS = {
     "join", "join group", "join now", "join whatsapp", "join group now",
     "i agree", "agree", "continue", "proceed", "rules", "invite",
@@ -177,6 +196,74 @@ def extract_whatsapp_links(text: str) -> list[str]:
             found.append(normalized)
 
     return list(dict.fromkeys(found))
+
+
+
+
+def extract_directory_internal_group_links(text: str, page_url: str) -> list[dict[str, str]]:
+    """
+    Extract public internal group paths used by directory sites.
+
+    For Groupsor-style pages:
+      /group/invite/<code>
+      /group/join/<code>
+      /group/rules/<code>
+
+    The uploaded Groupsor samples show that these internal codes lead to:
+      https://chat.whatsapp.com/invite/<same-code>
+
+    We keep the source internal URL too, so the result remains auditable.
+    """
+    found: list[dict[str, str]] = []
+    base_host = source_domain(page_url)
+
+    for match in DIRECTORY_INTERNAL_GROUP_RE.finditer(html.unescape(text or "")):
+        code = match.group("code") or match.group("code2")
+        kind = match.group("kind") or match.group("kind2") or "invite"
+        host = match.group("host")
+
+        if not code:
+            continue
+
+        if host:
+            # host can include path fragments if regex sees malformed HTML; normalize below.
+            internal_raw = f"https://{host}/group/{kind}/{code}"
+        else:
+            internal_raw = f"/group/{kind}/{code}"
+
+        internal_url = normalize_page_url(internal_raw, page_url)
+        if not internal_url:
+            continue
+
+        internal_host = source_domain(internal_url)
+
+        # Only infer WhatsApp URLs for Groupsor-like hosts where the public ID equals
+        # the final invite code pattern shown in the user-provided examples.
+        if internal_host not in GROUPSOR_HOST_HINTS and base_host not in GROUPSOR_HOST_HINTS:
+            continue
+
+        whatsapp_url = f"https://chat.whatsapp.com/invite/{code}"
+        normalized = normalize_whatsapp_url(whatsapp_url)
+        if not normalized:
+            continue
+
+        found.append({
+            "whatsapp_url": normalized,
+            "internal_url": internal_url,
+            "code": code,
+            "kind": kind,
+        })
+
+    # Dedupe by WhatsApp URL while preserving first source.
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in found:
+        key = row["whatsapp_url"]
+        if key not in seen:
+            out.append(row)
+            seen.add(key)
+
+    return out
 
 
 def is_whatsapp_url(url: str) -> bool:
@@ -426,6 +513,14 @@ class BrowserPiercer:
 
                         for link in extract_whatsapp_links(body + " " + resp_url):
                             self.capture_url(link, resp_url, source_query, "browser_ajax_body")
+
+                        for row in extract_directory_internal_group_links(body + " " + resp_url, resp_url):
+                            self.capture_url(
+                                row["whatsapp_url"],
+                                row["internal_url"],
+                                source_query,
+                                f"browser_ajax_groupsor_{row['kind']}",
+                            )
                     except Exception:
                         return
 
@@ -469,10 +564,12 @@ class BrowserPiercer:
                         await maybe_call(self.on_event, {"type": "log", "level": "WARNING", "message": f"Browser goto failed: {current} | {exc}"})
                         continue
 
-                    await page.wait_for_timeout(700)
+                    ajax_wait_ms = int(float(self.settings.get("ajax_wait_seconds", 8.0)) * 1000)
+                    await page.wait_for_timeout(max(700, ajax_wait_ms))
 
                     # Trigger lazy-loaded content before and after clicks.
                     await self.auto_scroll_page(page)
+                    await page.wait_for_timeout(1200)
                     await self.scan_pages(context, source_query, candidate.text)
 
                     html_text = await page.content()
@@ -501,13 +598,21 @@ class BrowserPiercer:
 
     async def auto_scroll_page(self, page) -> None:
         """
-        Helps with infinite-scroll/lazy-loaded lists.
-        Kept intentionally small so free Streamlit does not freeze.
+        Helps with delayed AJAX / infinite-scroll / lazy-loaded group lists.
+        Some Groupsor-like pages do not inject cards until after a few seconds
+        and a small scroll. This scrolls in controlled rounds and waits for XHR.
         """
         try:
-            for _ in range(4):
-                await page.evaluate("window.scrollBy(0, Math.max(600, window.innerHeight || 800));")
-                await page.wait_for_timeout(350)
+            rounds = int(self.settings.get("scroll_rounds", 10) or 10)
+            rounds = max(1, min(rounds, 60))
+
+            for _ in range(rounds):
+                await page.evaluate("window.scrollBy(0, Math.max(650, window.innerHeight || 850));")
+                await page.wait_for_timeout(650)
+
+            # Return near top and do one final scan-friendly wait.
+            await page.evaluate("window.scrollTo(0, 0);")
+            await page.wait_for_timeout(500)
         except Exception:
             return
 
@@ -516,8 +621,19 @@ class BrowserPiercer:
             try:
                 self.capture_url(page.url, page.url, source_query, "browser_current_url", click_text)
                 content = await page.content()
-                for link in extract_whatsapp_links(content + " " + page.url):
+                scan_blob = content + " " + page.url
+
+                for link in extract_whatsapp_links(scan_blob):
                     self.capture_url(link, page.url, source_query, "browser_dom", click_text)
+
+                for row in extract_directory_internal_group_links(scan_blob, page.url):
+                    self.capture_url(
+                        row["whatsapp_url"],
+                        row["internal_url"],
+                        source_query,
+                        f"browser_dom_groupsor_{row['kind']}",
+                        click_text,
+                    )
             except Exception:
                 continue
 
@@ -563,10 +679,12 @@ class BrowserPiercer:
                     try:
                         await el.scroll_into_view_if_needed(timeout=1000)
                         await el.click(timeout=2500)
-                        await page.wait_for_timeout(900)
+                        await page.wait_for_timeout(1400)
 
-                        # Some sites open a modal/popup after the first click.
-                        # Scan every page/modal state, then click newly visible relevant controls once more.
+                        # Some sites open a modal/popup or trigger AJAX after the first click.
+                        # Scroll, wait, and rescan every page/modal state.
+                        await self.auto_scroll_page(page)
+                        await page.wait_for_timeout(900)
                         await self.scan_pages(context, source_query, text)
 
                         try:
@@ -702,6 +820,21 @@ class CrawlEngine:
                 make_hit(link, final_url, task.source_query, "http_html")
                 for link in extract_whatsapp_links(text + " " + final_url)
             ]
+
+            # Groupsor-like fix: listing pages may expose only delayed/internal
+            # /group/join|invite|rules/<code> links. For Groupsor, that public code
+            # maps to the final WhatsApp invite code shown in the page flow.
+            for row in extract_directory_internal_group_links(text + " " + final_url, final_url):
+                hits.append(
+                    make_hit(
+                        row["whatsapp_url"],
+                        final_url,
+                        task.source_query,
+                        f"groupsor_internal_{row['kind']}",
+                        click_text=row["internal_url"],
+                        raw_url=row["internal_url"],
+                    )
+                )
 
             self.stats.raw_found += len(hits)
 
