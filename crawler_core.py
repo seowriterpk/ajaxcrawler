@@ -43,6 +43,16 @@ GROUPSOR_HOST_HINTS = {
     "www.groupsor.link",
 }
 
+
+GROUPSOR_INTERNAL_URL_RE = re.compile(
+    r"""(?ix)
+    (?:
+        https?://(?:www\.)?groupsor\.link
+    )?
+    /group/(?P<kind>join|invite|rules)/(?P<code>[A-Za-z0-9_-]{8,})
+    """
+)
+
 GOOD_CLICK_WORDS = {
     "join", "join group", "join now", "join whatsapp", "join group now",
     "i agree", "agree", "continue", "proceed", "rules", "invite",
@@ -202,59 +212,44 @@ def extract_whatsapp_links(text: str) -> list[str]:
 
 def extract_directory_internal_group_links(text: str, page_url: str) -> list[dict[str, str]]:
     """
-    Extract public internal group paths used by directory sites.
+    JS-console equivalent for Groupsor-style pages.
 
-    For Groupsor-style pages:
-      /group/invite/<code>
-      /group/join/<code>
-      /group/rules/<code>
+    It searches ANY visible/rendered HTML or AJAX body for:
+      /group/join/CODE
+      /group/invite/CODE
+      /group/rules/CODE
 
-    The uploaded Groupsor samples show that these internal codes lead to:
-      https://chat.whatsapp.com/invite/<same-code>
+    On groupsor.link, the public CODE maps to:
+      https://chat.whatsapp.com/invite/CODE
 
-    We keep the source internal URL too, so the result remains auditable.
+    This is exactly what the browser-console test confirmed by downloading 1200 rows.
     """
     found: list[dict[str, str]] = []
     base_host = source_domain(page_url)
 
-    for match in DIRECTORY_INTERNAL_GROUP_RE.finditer(html.unescape(text or "")):
-        code = match.group("code") or match.group("code2")
-        kind = match.group("kind") or match.group("kind2") or "invite"
-        host = match.group("host")
+    if base_host not in GROUPSOR_HOST_HINTS and "groupsor.link" not in (text or ""):
+        return []
+
+    for match in GROUPSOR_INTERNAL_URL_RE.finditer(html.unescape(text or "")):
+        kind = match.group("kind") or "join"
+        code = match.group("code") or ""
 
         if not code:
             continue
 
-        if host:
-            # host can include path fragments if regex sees malformed HTML; normalize below.
-            internal_raw = f"https://{host}/group/{kind}/{code}"
-        else:
-            internal_raw = f"/group/{kind}/{code}"
+        internal_url = f"https://groupsor.link/group/{kind}/{code}"
+        whatsapp_url = normalize_whatsapp_url(f"https://chat.whatsapp.com/invite/{code}")
 
-        internal_url = normalize_page_url(internal_raw, page_url)
-        if not internal_url:
-            continue
-
-        internal_host = source_domain(internal_url)
-
-        # Only infer WhatsApp URLs for Groupsor-like hosts where the public ID equals
-        # the final invite code pattern shown in the user-provided examples.
-        if internal_host not in GROUPSOR_HOST_HINTS and base_host not in GROUPSOR_HOST_HINTS:
-            continue
-
-        whatsapp_url = f"https://chat.whatsapp.com/invite/{code}"
-        normalized = normalize_whatsapp_url(whatsapp_url)
-        if not normalized:
+        if not whatsapp_url:
             continue
 
         found.append({
-            "whatsapp_url": normalized,
+            "whatsapp_url": whatsapp_url,
             "internal_url": internal_url,
             "code": code,
             "kind": kind,
         })
 
-    # Dedupe by WhatsApp URL while preserving first source.
     out: list[dict[str, str]] = []
     seen: set[str] = set()
     for row in found:
@@ -519,7 +514,7 @@ class BrowserPiercer:
                                 row["whatsapp_url"],
                                 row["internal_url"],
                                 source_query,
-                                f"browser_ajax_groupsor_{row['kind']}",
+                                f"groupsor_browser_ajax_{row['kind']}",
                             )
                     except Exception:
                         return
@@ -631,7 +626,7 @@ class BrowserPiercer:
                         row["whatsapp_url"],
                         row["internal_url"],
                         source_query,
-                        f"browser_dom_groupsor_{row['kind']}",
+                        f"groupsor_browser_dom_{row['kind']}",
                         click_text,
                     )
             except Exception:

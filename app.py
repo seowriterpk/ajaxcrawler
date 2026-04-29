@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
+import re
+import io
 from html import escape
 import time
 from datetime import datetime
@@ -256,6 +259,91 @@ def metric_row(stats: dict[str, Any]) -> None:
 
 
 
+
+def parse_browser_capture_upload(uploaded_file) -> list[dict[str, Any]]:
+    """
+    Accepts the CSV from the Chrome console detector:
+      text,internal_url,code,inferred_whatsapp
+
+    Also accepts JSON arrays with those fields.
+    Converts them into normal saved result rows.
+    """
+    if uploaded_file is None:
+        return []
+
+    name = (uploaded_file.name or "").lower()
+    raw = uploaded_file.getvalue()
+    text = raw.decode("utf-8", errors="ignore")
+
+    records: list[dict[str, Any]] = []
+
+    if name.endswith(".json"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                if isinstance(data.get("rows"), list):
+                    data = data["rows"]
+                elif isinstance(data.get("internalGroupLinks"), list):
+                    data = [
+                        {
+                            "internal_url": u,
+                            "code": (re.search(r"/group/(?:join|invite|rules)/([A-Za-z0-9_-]{8,})", str(u)) or ["", ""])[1],
+                            "inferred_whatsapp": "",
+                            "text": "",
+                        }
+                        for u in data["internalGroupLinks"]
+                    ]
+            if isinstance(data, list):
+                records = [x for x in data if isinstance(x, dict)]
+        except Exception:
+            records = []
+    else:
+        reader = csv.DictReader(io.StringIO(text))
+        records = [dict(row) for row in reader]
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    code_re = re.compile(r"/group/(?:join|invite|rules)/([A-Za-z0-9_-]{8,})")
+
+    for row in records:
+        internal_url = str(row.get("internal_url") or row.get("href") or row.get("url") or "").strip()
+        code = str(row.get("code") or "").strip()
+        inferred = str(row.get("inferred_whatsapp") or row.get("whatsapp_url") or row.get("invite_url") or "").strip()
+
+        if not code and internal_url:
+            m = code_re.search(internal_url)
+            code = m.group(1) if m else ""
+
+        if not inferred and code:
+            inferred = f"https://chat.whatsapp.com/invite/{code}"
+
+        if not inferred or inferred in seen:
+            continue
+
+        seen.add(inferred)
+
+        normalized = inferred.replace("https://chat.whatsapp.com/invite/", "https://chat.whatsapp.com/")
+
+        out.append({
+            "invite_url": inferred,
+            "normalized_url": normalized,
+            "source_page": internal_url or "browser_capture_upload",
+            "source_domain": "groupsor.link",
+            "source_query": "browser_capture_upload",
+            "discovered_at": datetime.now().isoformat(timespec="seconds"),
+            "extraction_method": "browser_capture_import",
+            "click_text": str(row.get("text") or ""),
+            "raw_url": internal_url,
+            "review_status": "unreviewed",
+            "keep_status": "keep",
+            "notes": "",
+            "tags": "groupsor,browser-capture",
+        })
+
+    return out
+
+
+
 def dataframe_from_results(rows: list[dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=[
@@ -466,9 +554,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_dashboard, tab_crawl, tab_results, tab_exports, tab_logs = st.tabs([
+tab_dashboard, tab_crawl, tab_capture, tab_results, tab_exports, tab_logs = st.tabs([
     "Dashboard",
     "Inputs & Crawl",
+    "Browser Capture",
     "Found Links",
     "Exports",
     "Logs & Maintenance",
@@ -493,7 +582,7 @@ with tab_dashboard:
     st.markdown(
         """
         <div class="ok-note">
-        This version stores both raw discoveries and unique normalized links. The browser fallback also scans AJAX/fetch response bodies, clicks scored load-more/show-more/join controls, scrolls lazy lists, and rescans popups/modals.
+        This version stores both raw discoveries and unique normalized links. For Groupsor, the proven winning path is visible internal /group/join/CODE links. Browser Capture Import can ingest the 1200+ links your Chrome console found and save them directly into Found Links.
         </div>
         """,
         unsafe_allow_html=True,
@@ -568,6 +657,53 @@ with tab_crawl:
                 st.session_state["crawl_running"] = False
                 append_log("ERROR", f"Crawl crashed: {exc}")
                 st.error(f"Crawl crashed: {exc}")
+
+
+with tab_capture:
+    st.subheader("Browser Capture Import")
+
+    st.markdown(
+        """
+        <div class="gf-note">
+        Your Chrome test proved the real data is already visible in the rendered page as
+        <code>/group/join/CODE</code> links. If Streamlit Cloud misses Groupsor because of delayed JS,
+        Cloudflare, or mobile lazy loading, upload the Chrome CSV here. The app converts those
+        internal rows into normalized WhatsApp invite rows and saves them to Found Links.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.code('(() => {\n  const CODE_RE = /\\/group\\/(?:join|invite|rules)\\/([A-Za-z0-9_-]{8,})/i;\n\n  const links = [...document.querySelectorAll("a[href]")]\n    .map(a => {\n      const href = new URL(a.getAttribute("href"), location.href).href;\n      const code = (href.match(CODE_RE) || [])[1] || "";\n      return {\n        text: (a.innerText || a.textContent || "").trim().replace(/\\s+/g, " "),\n        internal_url: href,\n        code,\n        inferred_whatsapp: code ? `https://chat.whatsapp.com/invite/${code}` : ""\n      };\n    })\n    .filter(x => /\\/group\\/(?:join|invite|rules)\\//i.test(x.internal_url));\n\n  const unique = [...new Map(links.map(x => [x.internal_url, x])).values()];\n\n  console.log("FOUND INTERNAL GROUP LINKS:", unique.length);\n  console.table(unique.slice(0, 50));\n\n  const csv = [\n    "text,internal_url,code,inferred_whatsapp",\n    ...unique.map(r => [\n      r.text,\n      r.internal_url,\n      r.code,\n      r.inferred_whatsapp\n    ].map(v => `"${String(v || "").replaceAll(\'"\', \'""\')}"`).join(","))\n  ].join("\\\\n");\n\n  const blob = new Blob([csv], { type: "text/csv" });\n  const a = document.createElement("a");\n  a.href = URL.createObjectURL(blob);\n  a.download = `groupsor-visible-links-${Date.now()}.csv`;\n  a.click();\n\n  return unique;\n})();', language="javascript")
+
+    capture_upload = st.file_uploader(
+        "Upload groupsor-visible-links CSV/JSON from Chrome",
+        type=["csv", "json"],
+        key="browser_capture_upload",
+    )
+
+    if capture_upload is not None:
+        parsed_rows = parse_browser_capture_upload(capture_upload)
+        st.success(f"Parsed {len(parsed_rows)} unique link row(s) from browser capture.")
+
+        if parsed_rows:
+            st.dataframe(dataframe_from_results(parsed_rows).head(100), use_container_width=True, height=360)
+
+            if st.button("Save Browser Capture to Found Links", type="primary", use_container_width=True):
+                info = append_results(parsed_rows)
+                append_log(
+                    "INFO",
+                    "Imported browser capture",
+                    raw_added=info.get("raw_added", 0),
+                    unique_added=info.get("unique_added", 0),
+                    total_unique=info.get("total_unique", 0),
+                )
+                st.success(
+                    f"Saved raw={info.get('raw_added', 0)}, "
+                    f"new unique={info.get('unique_added', 0)}, "
+                    f"total unique={info.get('total_unique', 0)}."
+                )
+
 
 
 with tab_results:
